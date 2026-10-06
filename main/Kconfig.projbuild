@@ -1,0 +1,5 @@
+menu "DeepSeek V0"
+config DEEPSEEK_MODEL
+    string "DeepSeek model"
+    default "deepseek-flash"
+endmenu
