@@ -21,10 +21,11 @@
 #include "nvs.h"
 #include "cJSON.h"
 #include "agent_led.h"
+#include "agent_oled.h"
 #define WIFI_OK BIT0
 #define WIFI_STARTED BIT1
 #define BODY_CAPACITY (64 * 1024)
-static const char *TAG = "deepseek_v4";
+static const char *TAG = "deepseek_v4_2";
 static EventGroupHandle_t events;
 static unsigned retries;
 static atomic_uint network_epoch;
@@ -66,11 +67,13 @@ static bool history_commit(const char *user, const char *assistant) {
 
 static void read_line(const char *label, char *out, size_t cap, bool allow_empty, bool secret) {
     static bool skip_lf;
+    if(strcmp(label,"You:"))agent_oled_notice("SETUP",secret ? "Enter secret on USB.\nHidden on OLED." : label);
     for (;;) {
         printf("\n%s\n", label); fflush(stdout);
         size_t n = 0; bool overflow = false;
         unsigned escape_state = 0;
         for (;;) {
+            agent_oled_poll();
             int c = getchar();
             if (c == EOF) { clearerr(stdin); vTaskDelay(pdMS_TO_TICKS(20)); continue; }
             /* Consume ANSI CSI/SS3 sequences, including bracketed-paste wrappers.
@@ -121,22 +124,26 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         retries = 0; connecting = false; next_connect_at = 0;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_STOP) {
         xEventGroupClearBits(events, WIFI_OK | WIFI_STARTED);
+        agent_oled_network(false);
         atomic_fetch_add(&network_epoch, 1); connecting = false;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
         xEventGroupClearBits(events, WIFI_OK);
+        agent_oled_network(false);
         atomic_fetch_add(&network_epoch, 1);
         ESP_LOGW(TAG, "Wi-Fi disconnected: reason=%u; queued API requests=0",
                  d ? (unsigned)d->reason : 0u);
         schedule_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         xEventGroupClearBits(events, WIFI_OK);
+        agent_oled_network(false);
         atomic_fetch_add(&network_epoch, 1);
         (void)esp_wifi_disconnect();
         schedule_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         retries = 0; connecting = false;
         xEventGroupSetBits(events, WIFI_OK);
+        agent_oled_network(true);
         ESP_LOGI(TAG, "Wi-Fi ONLINE; ready for NEW input; no request replay");
     }
     if (base != AGENT_NET_EVENT) return;
@@ -252,6 +259,66 @@ static bool cloud_ready(void) {
     }
     return true;
 }
+/* One versioned NVS blob keeps SSID/password together across power loss. */
+typedef struct {
+    uint32_t version;
+    char ssid[33];
+    char password[65];
+} wifi_profile_t;
+static bool wifi_profile_valid(const wifi_profile_t *p) {
+    if (p->version != 1 || !memchr(p->ssid, 0, sizeof(p->ssid)) ||
+        !memchr(p->password, 0, sizeof(p->password)) || !p->ssid[0]) return false;
+    size_t n = strlen(p->password);
+    if (n == 0 || (n >= 8 && n <= 63)) return true;
+    if (n != 64) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (!isxdigit((unsigned char)p->password[i])) return false;
+    return true;
+}
+static esp_err_t wifi_profile_load(wifi_profile_t *p) {
+    wipe_secret(p, sizeof(*p));
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("deepseek_agent", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t size = sizeof(*p);
+    err = nvs_get_blob(handle, "wifi_profile", p, &size);
+    nvs_close(handle);
+    if (err != ESP_OK || size != sizeof(*p) || !wifi_profile_valid(p)) {
+        wipe_secret(p, sizeof(*p));
+        return err == ESP_OK ? ESP_ERR_INVALID_ARG : err;
+    }
+    return ESP_OK;
+}
+static esp_err_t wifi_profile_save(const wifi_profile_t *p) {
+    if (!wifi_profile_valid(p)) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("deepseek_agent", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, "wifi_profile", p, sizeof(*p));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle); return err;
+}
+static esp_err_t wifi_profile_forget(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("deepseek_agent", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_erase_key(handle, "wifi_profile");
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle); return err;
+}
+static bool wifi_profile_prompt(wifi_profile_t *p, bool cancel_allowed) {
+    for (;;) {
+        wipe_secret(p, sizeof(*p)); p->version = 1;
+        read_line(cancel_allowed ? "New Wi-Fi SSID (blank cancels):" : "Wi-Fi SSID:",
+                  p->ssid, sizeof(p->ssid), cancel_allowed, false);
+        if (!p->ssid[0]) { wipe_secret(p, sizeof(*p)); return false; }
+        read_line("Wi-Fi password (masked; blank for open network):", p->password,
+                  sizeof(p->password), true, true);
+        if (wifi_profile_valid(p)) return true;
+        puts("Password must be blank, 8-63 bytes, or 64 hexadecimal characters. Enter again.");
+    }
+}
 static void show_error(int status) {
     switch (status) {
         case 400: ESP_LOGE(TAG, "Request rejected: check model and JSON parameters"); break;
@@ -274,6 +341,7 @@ static bool append_message(cJSON *messages, const char *role, const char *conten
 /* Transport returns the complete assistant message, including tool_calls. */
 static cJSON *post_chat(const char *key, const cJSON *request) {
     if (!cloud_ready()) return NULL;
+    agent_oled_notice("WAITING FOR AI", "HTTPS request...\nPlease wait.");
     unsigned request_epoch = atomic_load(&network_epoch);
     char *body = cJSON_PrintUnformatted(request);
     if (!body) return NULL;
@@ -343,7 +411,7 @@ static bool device_status(const char *arguments, char *result, size_t cap) {
     char led[128]; agent_led_state(led, sizeof(led));
     /* led is generated from firmware constants, never from user input. */
     int n = snprintf(result, cap,
-        "{\"ok\":true,\"firmware\":\"DEEPSEEK-V4-STATUS-20261006\","
+        "{\"ok\":true,\"firmware\":\"DEEPSEEK-V4.2-OLED-20261007\","
         "\"uptime_ms\":%lld,\"wifi_online\":%s,\"rssi_dbm\":%s,"
         "\"free_internal_bytes\":%u,\"free_psram_bytes\":%u,"
         "\"led_commanded_state\":\"%s\",\"successful_led_actions\":%u}",
@@ -447,6 +515,7 @@ static bool ask_deepseek(const char *key, const char *prompt) {
         } else {
             snprintf(result, sizeof(result), "{\"ok\":false,\"error\":\"unknown_tool\"}");
         }
+        agent_oled_notice("TOOL", tool_name);
         printf("TOOL %s: %s; turn=%u; successful_tool_actions=%u\n", tool_name, result, turn_number, tool_actions);
         if (!cJSON_AddStringToObject(result_message, "content", result) ||
             !cJSON_AddStringToObject(request, "tool_choice", "none")) goto cleanup;
@@ -461,6 +530,7 @@ static bool ask_deepseek(const char *key, const char *prompt) {
     cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
     if (!cJSON_IsString(content) || !content->valuestring[0]) goto cleanup;
     printf("\nDeepSeek: %s\n", content->valuestring);
+    agent_oled_reply(content->valuestring);
     ok = true;
     if (!history_commit(prompt, content->valuestring))
         ESP_LOGW(TAG, "Reply displayed but not saved (history capacity/allocation)");
@@ -475,7 +545,9 @@ cleanup:
 }
 
 void app_main(void) {
-    puts("\nFirmware: DEEPSEEK-V4-STATUS-20261006 (GPIO38; persistent key; automatic Wi-Fi reconnect)");
+    esp_err_t oled_err=agent_oled_init();
+    if(oled_err!=ESP_OK)ESP_LOGW(TAG,"OLED unavailable: %s; serial continues",esp_err_to_name(oled_err));
+    puts("\nFirmware: DEEPSEEK-V4.2-OLED-20261007 (GPIO38; persistent key; automatic Wi-Fi reconnect)");
     esp_err_t led_err = agent_led_init();
     if (led_err != ESP_OK) {
         ESP_LOGE(TAG, "RGB initialization failed: %s", esp_err_to_name(led_err)); return;
@@ -495,7 +567,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(err);
     events = xEventGroupCreate();
     if (!events) { ESP_LOGE(TAG, "Event group allocation failed"); return; }
-    char ssid[33], password[65], key[256] = {0};
+    char key[256] = {0};
+    wifi_profile_t profile = {0};
     esp_err_t key_err = key_load(key, sizeof(key));
     key_saved = key_err == ESP_OK;
     if (key_saved) puts("Saved API key loaded (hidden). Use /key set to change, /key clear to forget.");
@@ -504,8 +577,17 @@ void app_main(void) {
             ESP_LOGW(TAG, "Saved key unavailable: %s", esp_err_to_name(key_err));
         key_prompt(key, sizeof(key));
     }
-    read_line("Wi-Fi SSID:", ssid, sizeof(ssid), false, false);
-    read_line("Wi-Fi password (blank for open network):", password, sizeof(password), true, true);
+    esp_err_t profile_err = wifi_profile_load(&profile);
+    if (profile_err == ESP_OK) {
+        puts("Saved Wi-Fi profile loaded (credentials hidden). Use /wifi set to replace.");
+    } else {
+        if (profile_err != ESP_ERR_NVS_NOT_FOUND)
+            ESP_LOGW(TAG, "Saved Wi-Fi unavailable: %s", esp_err_to_name(profile_err));
+        (void)wifi_profile_prompt(&profile, false);
+        profile_err = wifi_profile_save(&profile);
+        if (profile_err == ESP_OK) puts("Wi-Fi profile saved. Future boots will reuse it.");
+        else ESP_LOGW(TAG, "Wi-Fi usable this boot, but save failed: %s", esp_err_to_name(profile_err));
+    }
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -519,15 +601,16 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &reconnect_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(reconnect_timer, 1000000));
     wifi_config_t wifi = {0};
-    memcpy(wifi.sta.ssid, ssid, strlen(ssid));
-    memcpy(wifi.sta.password, password, strlen(password));
+    memcpy(wifi.sta.ssid, profile.ssid, strlen(profile.ssid));
+    memcpy(wifi.sta.password, profile.password, strlen(profile.password));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
-    memset(password, 0, sizeof(password)); memset(&wifi, 0, sizeof(wifi));
+    wipe_secret(&profile, sizeof(profile)); wipe_secret(&wifi, sizeof(wifi));
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org"); esp_sntp_init();
-    puts("Chat ready; Wi-Fi and NTP run in background. /status /device /key set /key clear /led COLOR /state /clear /quit /help");
+    puts("Chat ready; Wi-Fi and NTP run in background. /tools /wifi set /wifi clear /status /device /key set /key clear /led COLOR /state /clear /quit /help");
+    agent_oled_notice("READY", "Enter question on USB.\n/next /prev: pages\n/screen: status\n/reply: last reply");
     char prompt[512];
     for (;;) {
         read_line("You:", prompt, sizeof(prompt), true, false);
@@ -535,8 +618,24 @@ void app_main(void) {
         for (size_t i = 0; prompt[i]; ++i)
             if (!isspace((unsigned char)prompt[i])) { has_text = true; break; }
         if (!has_text) continue;
+        if (!strcmp(prompt,"/next")){agent_oled_page(1);continue;}
+        if (!strcmp(prompt,"/prev")){agent_oled_page(-1);continue;}
+        if (!strcmp(prompt,"/reply")){agent_oled_page(0);continue;}
+        if (!strcmp(prompt,"/screen")){
+            char state[128], screen[256], signal[24]="RSSI unavailable";
+            wifi_ap_record_t ap;
+            if(esp_wifi_sta_get_ap_info(&ap)==ESP_OK)snprintf(signal,sizeof(signal),"RSSI %d dBm",ap.rssi);
+            agent_led_state(state,sizeof(state));
+            /* Strip explanatory suffix only on the compact OLED; serial keeps it. */
+            char *suffix=strchr(state,'(');if(suffix)*suffix=0;
+            snprintf(screen,sizeof(screen),"UP %lld s\n%s\nRAM %u KiB\nPSRAM %u KiB\n%s",
+                (long long)(esp_timer_get_time()/1000000),signal,
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)/1024),
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)/1024),state);
+            agent_oled_notice("STATUS SNAPSHOT",screen);continue;
+        }
         if (strcmp(prompt, "/quit") == 0) break;
-        if (strcmp(prompt, "/clear") == 0) { history_clear(); puts("History cleared."); continue; }
+        if (strcmp(prompt, "/clear") == 0) { history_clear(); puts("History cleared."); agent_oled_reply(""); agent_oled_notice("READY","History cleared."); continue; }
         if (strcmp(prompt, "/state") == 0) {
             char state[128]; agent_led_state(state, sizeof(state)); puts(state); continue;
         }
@@ -548,6 +647,25 @@ void app_main(void) {
         if (strcmp(prompt, "/device") == 0) {
             char result[1024]; (void)device_status("{}", result, sizeof(result));
             puts(result); continue;
+        }
+        if (strcmp(prompt, "/tools") == 0) {
+            puts("Available cloud tools (same schema sent to DeepSeek):");
+            puts(tool_schema); continue;
+        }
+        if (strcmp(prompt, "/wifi set") == 0) {
+            wifi_profile_t next = {0};
+            if (wifi_profile_prompt(&next, true)) {
+                esp_err_t result = wifi_profile_save(&next);
+                if (result == ESP_OK) puts("New Wi-Fi profile saved. Press RESET to use it; current connection unchanged.");
+                else ESP_LOGE(TAG, "Wi-Fi save failed: %s; current connection unchanged", esp_err_to_name(result));
+            }
+            wipe_secret(&next, sizeof(next)); continue;
+        }
+        if (strcmp(prompt, "/wifi clear") == 0) {
+            esp_err_t result = wifi_profile_forget();
+            if (result == ESP_OK) puts("Saved Wi-Fi removed. Next boot asks for Wi-Fi; current connection and API key unchanged.");
+            else ESP_LOGE(TAG, "Wi-Fi removal failed: %s", esp_err_to_name(result));
+            continue;
         }
         if (strcmp(prompt, "/status") == 0) {
             time_t now; time(&now);
@@ -567,20 +685,23 @@ void app_main(void) {
             continue;
         }
         if (strcmp(prompt, "/help") == 0) {
-            puts("/led red|green|blue|yellow|cyan|purple|white|off; /state; /status; /device; /key set; /key clear; /clear; /quit. /quit preserves saved key."); continue;
+            puts("/led red|green|blue|yellow|cyan|purple|white|off; /next; /prev; /reply; /screen; /tools; /wifi set; /wifi clear; /state; /status; /device; /key set; /key clear; /clear; /quit. /quit preserves saved key."); continue;
         }
         if (prompt[0] == '/') { puts("Unknown command. Use /help."); continue; }
         if (!key[0]) { puts("No API key. Use /key set."); continue; }
-        if (!cloud_ready()) continue;
+        if (!cloud_ready()) { agent_oled_notice("NOT READY","Check Wi-Fi and clock.\nUse /status on USB."); continue; }
         ++turn_number;
         ESP_LOGI(TAG, "Turn %u started; no automatic request retry", turn_number);
         bool ok = ask_deepseek(key, prompt);
+        if(!ok)agent_oled_notice("REQUEST FAILED","See USB log for cause.\nLED may have changed.\nNo automatic retry.");
         ESP_LOGI(TAG, "%s", ok ? "TURN PASS" : "TURN FAIL; history unchanged; no automatic resend");
     }
+    agent_oled_notice("STOPPED","Chat ended.\nRESET to start again.");
     history_clear();
     if (!agent_led_set("off", 0)) ESP_LOGW(TAG, "Could not switch LED off");
     wipe_secret(key, sizeof(key));
     ESP_ERROR_CHECK(esp_timer_stop(reconnect_timer));
     ESP_ERROR_CHECK(esp_wifi_stop());
+    agent_oled_network(false);agent_oled_poll();
     puts("Chat ended; RAM history/key cleared. Saved NVS key retained. RESET to start again.");
 }
